@@ -1,0 +1,1027 @@
+//! Preparing an update: the installed package, the release's matching file, its download,
+//! verification against `SHA256SUMS.txt`, and unpacking next to the app.
+//!
+//! Everything goes into a staging folder next to the installation ([`Installation::staging`]):
+//! `new/` holds the new package's entries, `ready.json` says which version they are, and the
+//! swap ([`crate::apply`]) moves the replaced entries into `old-*` folders, removed at a later
+//! start by [`Installation::clean_up`].
+
+use std::fs::{self, File};
+use std::io::{self, Read, Write};
+use std::path::{Component, Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+#[cfg(any(target_os = "macos", test))]
+use crate::signature::{self, SignatureInfo};
+use crate::{Release, UpdateError, Version, agent};
+
+/// The file the release workflow puts in each package: next to the executables, or in
+/// `Contents/Resources` of the macOS app.
+pub const MARKER: &str = "package.json";
+
+/// The checksums of a release's files.
+pub const SUMS: &str = "SHA256SUMS.txt";
+
+pub(crate) const READY: &str = "ready.json";
+pub(crate) const FAILED: &str = "failed.txt";
+const NEW: &str = "new";
+
+/// What `package.json` says.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PackageInfo {
+    /// The package's kind, as in its file name: `windows-x86_64`, `windows-x86_64-intel-npu`,
+    /// `linux-x86_64`, or `macos-arm64`.
+    pub kind: String,
+    /// The package's top-level files and folders (Windows and Linux). An update replaces these
+    /// only: anything else in the folder, such as a model kept there, stays.
+    #[serde(default)]
+    pub entries: Vec<String>,
+}
+
+impl PackageInfo {
+    pub fn read(path: &Path) -> Result<Self, UpdateError> {
+        let json = fs::read_to_string(path).map_err(|e| io_error(path, e))?;
+        let info: Self = serde_json::from_str(&json)
+            .map_err(|e| UpdateError::Format(format!("{}: {e}", path.display())))?;
+        // The entries become paths: one that could leave the folder is not taken.
+        if info.entries.iter().any(|entry| !is_plain_name(entry)) {
+            return Err(UpdateError::Format(format!(
+                "{}: an entry is not a plain name",
+                path.display()
+            )));
+        }
+        Ok(info)
+    }
+}
+
+/// An installed copy of the app, from a package.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Installation {
+    pub package: PackageInfo,
+    /// The folder holding what an update replaces: the app's folder, or on macOS the folder
+    /// holding the app.
+    pub root: PathBuf,
+    /// The names in `root` that an update replaces: the package's entries, or on macOS the app.
+    pub entries: Vec<String>,
+    /// The running executable.
+    pub executable: PathBuf,
+    /// The app bundle on macOS.
+    pub bundle: Option<PathBuf>,
+}
+
+impl Installation {
+    /// The installation of the running executable. A build from source has no `package.json`.
+    /// On macOS the bundle must also have a verified Developer ID signature.
+    pub fn current() -> Result<Self, UpdateError> {
+        let exe = std::env::current_exe()
+            .and_then(|exe| exe.canonicalize())
+            .map_err(|e| UpdateError::Io(format!("cannot find the running executable: {e}")))?;
+        let installation = Self::of_executable(&plain(exe), cfg!(target_os = "macos"))?;
+        #[cfg(target_os = "macos")]
+        {
+            installation.check_location()?;
+            if installation.running_signature()?.version != Version::current() {
+                return Err(UpdateError::NoUpdateSigner);
+            }
+        }
+        Ok(installation)
+    }
+
+    /// The installation of `exe`, laid out as on macOS (inside an app bundle) or not.
+    pub fn of_executable(exe: &Path, macos: bool) -> Result<Self, UpdateError> {
+        let not_packaged = || UpdateError::NotPackaged(exe.display().to_string());
+        let dir = exe.parent().ok_or_else(not_packaged)?;
+        if macos {
+            // …/Name.app/Contents/MacOS/executable
+            let contents = dir.parent().ok_or_else(not_packaged)?;
+            let bundle = contents.parent().ok_or_else(not_packaged)?;
+            if bundle.extension().is_none_or(|ext| ext != "app") {
+                return Err(not_packaged());
+            }
+            let marker = contents.join("Resources").join(MARKER);
+            if !marker.is_file() {
+                return Err(not_packaged());
+            }
+            let name = bundle.file_name().ok_or_else(not_packaged)?;
+            Ok(Self {
+                package: PackageInfo::read(&marker)?,
+                root: bundle.parent().ok_or_else(not_packaged)?.to_path_buf(),
+                entries: vec![name.to_string_lossy().into_owned()],
+                executable: exe.to_path_buf(),
+                bundle: Some(bundle.to_path_buf()),
+            })
+        } else {
+            let marker = dir.join(MARKER);
+            if !marker.is_file() {
+                return Err(not_packaged());
+            }
+            let package = PackageInfo::read(&marker)?;
+            Ok(Self {
+                entries: package.entries.clone(),
+                package,
+                root: dir.to_path_buf(),
+                executable: exe.to_path_buf(),
+                bundle: None,
+            })
+        }
+    }
+
+    fn is_macos(&self) -> bool {
+        self.bundle.is_some()
+    }
+
+    #[cfg(target_os = "macos")]
+    fn check_location(&self) -> Result<(), UpdateError> {
+        use rustix::fs::{Access, AtFlags, CWD, StatVfsMountFlags, accessat, statvfs};
+
+        let bundle = self.bundle.as_deref().ok_or(UpdateError::NoUpdateSigner)?;
+        if bundle
+            .components()
+            .any(|part| part.as_os_str() == "AppTranslocation")
+            || !statvfs(bundle).is_ok_and(|stats| !stats.f_flag.contains(StatVfsMountFlags::RDONLY))
+            || accessat(
+                CWD,
+                &self.root,
+                Access::WRITE_OK | Access::EXEC_OK,
+                AtFlags::EACCESS,
+            )
+            .is_err()
+        {
+            return Err(UpdateError::InstallLocation);
+        }
+        Ok(())
+    }
+
+    /// The name of this installation's package in a release of `version`, such as
+    /// `private-translate-0.5.1-windows-x86_64.zip`.
+    pub fn asset_name(&self, version: Version) -> String {
+        let kind = &self.package.kind;
+        let extension = if kind.starts_with("windows") {
+            "zip"
+        } else if kind.starts_with("macos") {
+            "dmg"
+        } else {
+            "tar.gz"
+        };
+        format!("private-translate-{version}-{kind}.{extension}")
+    }
+
+    /// Where an update is prepared: `update` in the app's folder, or next to the macOS app a
+    /// hidden folder named after it (other copies of the app may share that folder). On the same
+    /// volume as the installation, so that the swap only renames.
+    pub fn staging(&self) -> PathBuf {
+        match &self.bundle {
+            Some(bundle) => {
+                let name = bundle.file_stem().unwrap_or_default().to_string_lossy();
+                self.root.join(format!(".{name}-update"))
+            }
+            None => self.root.join("update"),
+        }
+    }
+
+    /// The prepared package's entries.
+    pub(crate) fn new_dir(&self) -> PathBuf {
+        self.staging().join(NEW)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn running_signature(&self) -> Result<SignatureInfo, UpdateError> {
+        let bundle = self.bundle.as_deref().ok_or(UpdateError::NoUpdateSigner)?;
+        signature::running_signature(bundle, |path| signature::codesign_info(path, false))
+    }
+
+    #[cfg(target_os = "macos")]
+    fn verify_staged(
+        &self,
+        running: &SignatureInfo,
+        bundle: &Path,
+        version: Version,
+    ) -> Result<(), UpdateError> {
+        self.verify_staged_with(
+            running,
+            bundle,
+            version,
+            |path| signature::codesign_info(path, true),
+            signature::gatekeeper_accepts,
+        )
+    }
+
+    #[cfg(any(target_os = "macos", test))]
+    fn verify_staged_with(
+        &self,
+        running: &SignatureInfo,
+        bundle: &Path,
+        version: Version,
+        signature: impl FnOnce(&Path) -> Option<SignatureInfo>,
+        assess: impl FnOnce(&Path) -> bool,
+    ) -> Result<(), UpdateError> {
+        signature::verify_update(running, bundle, version, signature)
+            .and_then(|()| {
+                assess(bundle)
+                    .then_some(())
+                    .ok_or(UpdateError::GatekeeperRejected)
+            })
+            .inspect_err(|_| self.discard_staged())
+    }
+
+    #[cfg(any(target_os = "macos", test))]
+    fn discard_staged(&self) {
+        let _ = fs::remove_file(self.staging().join(READY));
+        remove_what_can_go(&self.new_dir());
+    }
+
+    /// Recheck the exact bundle the plan will execute, including after an app restart.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn verify_before_apply(&self, bundle: &Path) -> Result<(), UpdateError> {
+        self.check_location()?;
+        let running = self.running_signature()?;
+        let ready: Ready = fs::read_to_string(self.staging().join(READY))
+            .ok()
+            .and_then(|json| serde_json::from_str(&json).ok())
+            .ok_or_else(|| UpdateError::Format("no prepared update version".into()))?;
+        self.verify_staged(&running, bundle, ready.version)
+    }
+
+    /// Downloads `release`'s package for this installation, checks it against the release's
+    /// `SHA256SUMS.txt`, and unpacks it into the staging folder. `progress(done, total)` follows
+    /// the download.
+    pub fn prepare(
+        &self,
+        release: &Release,
+        progress: &mut dyn FnMut(u64, u64),
+    ) -> Result<(), UpdateError> {
+        #[cfg(target_os = "macos")]
+        let running = if self.is_macos() {
+            self.check_location()?;
+            let running = self.running_signature()?;
+            signature::require_newer(release.version, running.version)?;
+            Some(running)
+        } else {
+            None
+        };
+        let name = self.asset_name(release.version);
+        let asset = release
+            .assets
+            .iter()
+            .find(|asset| asset.name == name)
+            .ok_or_else(|| UpdateError::NoPackage(name.clone()))?;
+        let sums = release
+            .assets
+            .iter()
+            .find(|asset| asset.name == SUMS)
+            .ok_or_else(|| UpdateError::NoPackage(SUMS.into()))?;
+
+        let staging = self.staging();
+        // What an earlier attempt left, except the `old-*` folders of a finished update, which
+        // may still be in use.
+        self.clean_up(release.version);
+        remove_if_exists(&self.new_dir())?;
+        fs::create_dir_all(&staging).map_err(|e| UpdateError::NotWritable(e.to_string()))?;
+
+        let agent = agent();
+        let sums = agent
+            .get(&sums.url)
+            .call()
+            .map_err(|e| UpdateError::Http(e.to_string()))?
+            .body_mut()
+            .read_to_string()
+            .map_err(|e| UpdateError::Http(e.to_string()))?;
+        let expected = checksum_of(&sums, &name)
+            .ok_or_else(|| UpdateError::Format(format!("{SUMS} has no line for {name}")))?;
+
+        let download = staging.join(&name);
+        let actual = download_to(&agent, &asset.url, asset.size, &download, progress)?;
+        if actual != expected {
+            let _ = fs::remove_file(&download);
+            return Err(UpdateError::Checksum(name));
+        }
+
+        let new = self.new_dir();
+        let unpacked = if self.is_macos() {
+            #[cfg(target_os = "macos")]
+            {
+                let running = running.as_ref().expect("macOS app has a verified signer");
+                verify_then_unpack_dmg(
+                    || signature::verify_disk_image(&download, running),
+                    || unpack_dmg(&download, &new),
+                )
+            }
+            #[cfg(not(target_os = "macos"))]
+            Err(UpdateError::Format("macOS updates require macOS".into()))
+        } else if name.ends_with(".zip") {
+            unpack_zip(&download, &new)
+        } else {
+            unpack_tar_gz(&download, &new)
+        };
+        let _ = fs::remove_file(&download);
+        unpacked?;
+
+        // The new package must be the same kind as this one.
+        let marker = if self.is_macos() {
+            let bundle = new_bundle(&new)?;
+            #[cfg(target_os = "macos")]
+            if let Some(running) = &running {
+                self.verify_staged(running, &bundle, release.version)?;
+            }
+            bundle.join("Contents/Resources").join(MARKER)
+        } else {
+            new.join(MARKER)
+        };
+        let package = PackageInfo::read(&marker)?;
+        if package.kind != self.package.kind {
+            return Err(UpdateError::Format(format!(
+                "the new package is for {}, not {}",
+                package.kind, self.package.kind
+            )));
+        }
+        write_json(
+            &staging.join(READY),
+            &Ready {
+                version: release.version,
+            },
+        )
+    }
+
+    /// The version prepared in the staging folder, if it is newer than `current` and its files
+    /// are there (a swap moves them out).
+    pub fn prepared(&self, current: Version) -> Option<Version> {
+        let ready: Ready = fs::read_to_string(self.staging().join(READY))
+            .ok()
+            .and_then(|json| serde_json::from_str(&json).ok())?;
+        let new = self.new_dir();
+        let complete = match self.is_macos() {
+            true => new_bundle(&new).is_ok(),
+            false => new.join(MARKER).is_file(),
+        };
+        (ready.version > current && complete).then_some(ready.version)
+    }
+
+    /// Clears the staging folder at start, keeping an update prepared for a version newer than
+    /// `current`. Returns why the last update failed, if it did: the app reports it. What cannot
+    /// be removed because it is in use is left for the next start.
+    pub fn clean_up(&self, current: Version) -> Option<String> {
+        let staging = self.staging();
+        let failed = fs::read_to_string(staging.join(FAILED)).ok();
+        let keep = failed.is_none() && self.prepared(current).is_some();
+        let Ok(entries) = fs::read_dir(&staging) else {
+            return failed;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            if keep && (name == NEW || name == READY) {
+                continue;
+            }
+            remove_what_can_go(&entry.path());
+        }
+        let _ = fs::remove_dir(&staging);
+        failed
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct Ready {
+    version: Version,
+}
+
+/// `path` without the `\\?\` prefix that `canonicalize` gives on Windows. The app starts the new
+/// version with it, and a path written so would not compare equal to the same one written plainly,
+/// in package metadata. Other paths (`\\?\UNC\…`, other systems) are kept.
+fn plain(path: PathBuf) -> PathBuf {
+    if cfg!(windows)
+        && let Some(rest) = path.to_str().and_then(without_verbatim_prefix)
+    {
+        return PathBuf::from(rest);
+    }
+    path
+}
+
+/// `C:\…` from `\\?\C:\…`; `None` for anything else.
+fn without_verbatim_prefix(path: &str) -> Option<&str> {
+    let rest = path.strip_prefix(r"\\?\")?;
+    (rest.as_bytes().get(1) == Some(&b':')).then_some(rest)
+}
+
+/// The app bundle in an unpacked macOS package.
+pub(crate) fn new_bundle(new: &Path) -> Result<PathBuf, UpdateError> {
+    let mut bundles = fs::read_dir(new)
+        .map_err(|e| io_error(new, e))?
+        .flatten()
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "app"));
+    let bundle = bundles
+        .next()
+        .ok_or_else(|| UpdateError::Format("the disk image has no app".into()))?;
+    if bundles.next().is_some() {
+        return Err(UpdateError::Format(
+            "the disk image has multiple apps".into(),
+        ));
+    }
+    Ok(bundle)
+}
+
+/// The checksum `SHA256SUMS.txt` gives for `name` (`<hex>  <name>` lines).
+fn checksum_of(sums: &str, name: &str) -> Option<String> {
+    sums.lines().find_map(|line| {
+        let (digest, file) = line.trim().split_once(char::is_whitespace)?;
+        // `*name` marks binary mode in sha256sum's output.
+        let file = file.trim_start().trim_start_matches('*');
+        (file == name && digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit()))
+            .then(|| digest.to_ascii_lowercase())
+    })
+}
+
+/// Downloads `url` into `path`, at most `size` bytes, and returns its SHA-256.
+fn download_to(
+    agent: &ureq::Agent,
+    url: &str,
+    size: u64,
+    path: &Path,
+    progress: &mut dyn FnMut(u64, u64),
+) -> Result<String, UpdateError> {
+    let mut response = agent
+        .get(url)
+        .call()
+        .map_err(|e| UpdateError::Http(e.to_string()))?;
+    let mut reader = response.body_mut().as_reader().take(size);
+    let mut file = File::create(path).map_err(|e| UpdateError::NotWritable(e.to_string()))?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0; 1 << 16];
+    let mut done = 0;
+    progress(0, size);
+    loop {
+        let n = match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(UpdateError::Http(e.to_string())),
+        };
+        file.write_all(&buf[..n]).map_err(|e| io_error(path, e))?;
+        hasher.update(&buf[..n]);
+        done += n as u64;
+        progress(done, size);
+    }
+    file.flush().map_err(|e| io_error(path, e))?;
+    if done != size {
+        return Err(UpdateError::Http(format!(
+            "the download ended after {done} of {size} bytes"
+        )));
+    }
+    Ok(hex(&hasher.finalize()))
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The path inside the package's top folder (`private-translate-…/`), from an archive
+/// entry's name; `None` for the top folder itself. Names that could leave the folder are refused.
+fn inner_path(name: &str) -> Result<Option<PathBuf>, UpdateError> {
+    // Zips written on Windows may separate with backslashes.
+    let parts: Vec<&str> = name.split(['/', '\\']).filter(|p| !p.is_empty()).collect();
+    if parts.iter().any(|part| !is_plain_name(part)) {
+        return Err(UpdateError::Format(format!(
+            "unsafe path in the package: {name}"
+        )));
+    }
+    Ok((parts.len() > 1).then(|| parts[1..].iter().collect()))
+}
+
+/// A single path component: not empty, `.`, `..`, a root, or a drive.
+fn is_plain_name(name: &str) -> bool {
+    let mut components = Path::new(name).components();
+    matches!(components.next(), Some(Component::Normal(_)))
+        && components.next().is_none()
+        && !name.contains(['/', '\\', ':'])
+}
+
+/// Unpacks a Windows package (a zip of one folder) into `dest`.
+fn unpack_zip(archive: &Path, dest: &Path) -> Result<(), UpdateError> {
+    let file = File::open(archive).map_err(|e| io_error(archive, e))?;
+    let mut zip =
+        zip::ZipArchive::new(file).map_err(|e| UpdateError::Format(format!("zip: {e}")))?;
+    fs::create_dir_all(dest).map_err(|e| io_error(dest, e))?;
+    for i in 0..zip.len() {
+        let mut entry = zip
+            .by_index(i)
+            .map_err(|e| UpdateError::Format(format!("zip: {e}")))?;
+        let name = entry
+            .name()
+            .map_err(|e| UpdateError::Format(format!("zip: {e}")))?
+            .into_owned();
+        let Some(inner) = inner_path(&name)? else {
+            continue;
+        };
+        let path = dest.join(inner);
+        if entry.is_dir() {
+            fs::create_dir_all(&path).map_err(|e| io_error(&path, e))?;
+            continue;
+        }
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|e| io_error(parent, e))?;
+        }
+        let mut out = File::create(&path).map_err(|e| io_error(&path, e))?;
+        io::copy(&mut entry, &mut out).map_err(|e| io_error(&path, e))?;
+        #[cfg(unix)]
+        if let Some(mode) = entry.unix_mode() {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&path, fs::Permissions::from_mode(mode & 0o777));
+        }
+    }
+    Ok(())
+}
+
+/// Unpacks a Linux package (a gzipped tar of one folder) into `dest`. Links are refused: the
+/// packages have none.
+fn unpack_tar_gz(archive: &Path, dest: &Path) -> Result<(), UpdateError> {
+    let file = File::open(archive).map_err(|e| io_error(archive, e))?;
+    let mut tar = tar::Archive::new(flate2::read::GzDecoder::new(file));
+    fs::create_dir_all(dest).map_err(|e| io_error(dest, e))?;
+    let entries = tar
+        .entries()
+        .map_err(|e| UpdateError::Format(format!("tar: {e}")))?;
+    for entry in entries {
+        let mut entry = entry.map_err(|e| UpdateError::Format(format!("tar: {e}")))?;
+        let name = entry
+            .path()
+            .map_err(|e| UpdateError::Format(format!("tar: {e}")))?
+            .to_string_lossy()
+            .into_owned();
+        let Some(inner) = inner_path(&name)? else {
+            continue;
+        };
+        let kind = entry.header().entry_type();
+        if !(kind.is_file() || kind.is_dir()) {
+            return Err(UpdateError::Format(format!(
+                "unexpected entry in the package: {name}"
+            )));
+        }
+        let path = dest.join(inner);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|e| io_error(parent, e))?;
+        }
+        entry.unpack(&path).map_err(|e| io_error(&path, e))?;
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn verify_then_unpack_dmg(
+    verify: impl FnOnce() -> bool,
+    unpack: impl FnOnce() -> Result<(), UpdateError>,
+) -> Result<(), UpdateError> {
+    if !verify() {
+        return Err(UpdateError::InvalidDiskImageSignature);
+    }
+    unpack()
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn image_needs_no_interaction(properties: &serde_json::Value) -> bool {
+    properties["Encrypted"].as_bool() == Some(false)
+        && properties["Software License Agreement"].as_bool() == Some(false)
+}
+
+/// Reject encrypted images and images with licence agreements before asking DiskImages to
+/// mount them. Missing or unreadable metadata also fails closed.
+#[cfg(target_os = "macos")]
+fn check_image_properties(image: &Path) -> Result<(), UpdateError> {
+    use std::process::{Command, Stdio};
+
+    let mut info = Command::new("/usr/bin/hdiutil")
+        .args(["imageinfo", "-plist", "-stdinpass"])
+        .arg(image)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .stdout(Stdio::piped())
+        .spawn()
+        .map_err(|_| UpdateError::InteractiveDiskImage)?;
+    let properties = Command::new("/usr/bin/plutil")
+        .args(["-extract", "Properties", "json", "-o", "-", "-"])
+        .stdin(info.stdout.take().expect("piped stdout"))
+        .output();
+    let info_ok = info.wait().is_ok_and(|status| status.success());
+    if info_ok
+        && let Ok(output) = properties
+        && output.status.success()
+        && let Ok(properties) = serde_json::from_slice(&output.stdout)
+        && image_needs_no_interaction(&properties)
+    {
+        return Ok(());
+    }
+    Err(UpdateError::InteractiveDiskImage)
+}
+
+/// Copies the app out of a verified macOS disk image into `dest`.
+#[cfg(target_os = "macos")]
+fn unpack_dmg(image: &Path, dest: &Path) -> Result<(), UpdateError> {
+    use std::process::{Command, Stdio};
+
+    check_image_properties(image)?;
+    let mount = dest.with_file_name("mount");
+    let _ = fs::remove_dir(&mount);
+    fs::create_dir_all(&mount).map_err(|e| io_error(&mount, e))?;
+    fs::create_dir_all(dest).map_err(|e| io_error(dest, e))?;
+    let run = |command: &mut Command| -> Result<(), UpdateError> {
+        let output = command
+            .output()
+            .map_err(|e| UpdateError::Io(format!("cannot run {command:?}: {e}")))?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(UpdateError::Io(format!(
+                "{command:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )))
+        }
+    };
+    run(Command::new("/usr/bin/hdiutil")
+        .args([
+            "attach",
+            "-nobrowse",
+            "-readonly",
+            "-noautoopen",
+            "-owners",
+            "off",
+            "-stdinpass",
+            "-mountpoint",
+        ])
+        .stdin(Stdio::null())
+        .arg(&mount)
+        .arg(image))?;
+    let copied = new_bundle(&mount).and_then(|app| {
+        let name = app.file_name().expect("a bundle has a name");
+        // ditto keeps the bundle's attributes and signature.
+        run(Command::new("/usr/bin/ditto")
+            .arg(&app)
+            .arg(dest.join(name)))
+    });
+    let detached = run(Command::new("/usr/bin/hdiutil")
+        .args(["detach", "-quiet"])
+        .arg(&mount));
+    let _ = fs::remove_dir(&mount);
+    copied.and(detached)
+}
+
+/// Removes `path` and its contents, leaving files still in use on Windows for another attempt.
+fn remove_what_can_go(path: &Path) {
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return;
+    };
+    if metadata.is_dir() {
+        if let Ok(entries) = fs::read_dir(path) {
+            for entry in entries.flatten() {
+                remove_what_can_go(&entry.path());
+            }
+        }
+        let _ = fs::remove_dir(path);
+    } else {
+        let _ = fs::remove_file(path);
+    }
+}
+
+fn remove_if_exists(path: &Path) -> Result<(), UpdateError> {
+    match fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(io_error(path, e)),
+    }
+}
+
+pub(crate) fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), UpdateError> {
+    let json = serde_json::to_string_pretty(value).expect("plain data serializes");
+    fs::write(path, json).map_err(|e| io_error(path, e))
+}
+
+pub(crate) fn io_error(path: &Path, e: io::Error) -> UpdateError {
+    UpdateError::Io(format!("{}: {e}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn package(dir: &Path, kind: &str, entries: &[&str]) {
+        fs::create_dir_all(dir).unwrap();
+        write_json(
+            &dir.join(MARKER),
+            &PackageInfo {
+                kind: kind.into(),
+                entries: entries.iter().map(|e| e.to_string()).collect(),
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn verifies_the_disk_image_before_mounting_and_never_mounts_a_rejected_image() {
+        let verified = std::cell::Cell::new(false);
+        assert!(
+            verify_then_unpack_dmg(
+                || {
+                    verified.set(true);
+                    true
+                },
+                || {
+                    assert!(verified.get(), "verification must precede mount");
+                    Ok(())
+                }
+            )
+            .is_ok()
+        );
+        assert!(matches!(
+            verify_then_unpack_dmg(|| false, || panic!("an unverified image must not mount")),
+            Err(UpdateError::InvalidDiskImageSignature)
+        ));
+    }
+
+    #[test]
+    fn refuses_disk_images_that_need_interaction_or_lack_properties() {
+        for (encrypted, license, acceptable) in [
+            (false, false, true),
+            (true, false, false),
+            (false, true, false),
+        ] {
+            assert_eq!(
+                image_needs_no_interaction(&serde_json::json!({
+                    "Encrypted": encrypted,
+                    "Software License Agreement": license,
+                })),
+                acceptable
+            );
+        }
+        assert!(!image_needs_no_interaction(
+            &serde_json::json!({"Encrypted": false})
+        ));
+    }
+
+    #[test]
+    fn gatekeeper_acceptance_keeps_the_prepared_update_and_rejection_discards_it() {
+        for accepted in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let installed = dir.path().join("Installed.app");
+            package(&installed.join("Contents/Resources"), "macos-arm64", &[]);
+            let installation =
+                Installation::of_executable(&installed.join("Contents/MacOS/app"), true).unwrap();
+            let staged = installation.new_dir().join("Staged.app");
+            package(&staged.join("Contents/Resources"), "macos-arm64", &[]);
+
+            let current = "0.1.1".parse().unwrap();
+            let version = "0.1.2".parse().unwrap();
+            let ready = installation.staging().join(READY);
+            write_json(&ready, &Ready { version }).unwrap();
+            let signature = |version| SignatureInfo {
+                team_id: "TEAM".into(),
+                bundle_id: "app".into(),
+                version,
+            };
+            let signed = std::cell::Cell::new(false);
+            let result = installation.verify_staged_with(
+                &signature(current),
+                &staged,
+                version,
+                |path| {
+                    assert_eq!(path, staged);
+                    signed.set(true);
+                    Some(signature(version))
+                },
+                |path| {
+                    assert!(
+                        signed.get(),
+                        "signature verification must precede assessment"
+                    );
+                    assert_eq!(path, staged);
+                    accepted
+                },
+            );
+            if accepted {
+                result.unwrap();
+                assert_eq!(installation.prepared(current), Some(version));
+            } else {
+                assert!(matches!(result, Err(UpdateError::GatekeeperRejected)));
+                assert!(!installation.new_dir().exists());
+                assert!(!ready.exists());
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn refuses_to_replace_a_translocated_app() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = dir
+            .path()
+            .join("AppTranslocation/token/d/Private Translate.app");
+        package(&bundle.join("Contents/Resources"), "macos-arm64", &[]);
+        let installation =
+            Installation::of_executable(&bundle.join("Contents/MacOS/app"), true).unwrap();
+        assert!(matches!(
+            installation.check_location(),
+            Err(UpdateError::InstallLocation)
+        ));
+    }
+
+    #[test]
+    fn finds_the_installation_of_an_executable() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = dir.path().join("private-translate-0.5.0-linux-x86_64");
+        package(&app, "linux-x86_64", &["private-translate", MARKER]);
+        let exe = app.join("private-translate");
+        let found = Installation::of_executable(&exe, false).unwrap();
+        assert_eq!(found.root, app);
+        assert_eq!(found.entries, ["private-translate", MARKER]);
+        assert_eq!(found.staging(), app.join("update"));
+        assert_eq!(
+            found.asset_name(Version::current()),
+            format!(
+                "private-translate-{}-linux-x86_64.tar.gz",
+                Version::current()
+            )
+        );
+        // A build from source has no marker.
+        assert!(matches!(
+            Installation::of_executable(&dir.path().join("target/release/app"), false),
+            Err(UpdateError::NotPackaged(_))
+        ));
+
+        let bundle = dir.path().join("Applications/Private Translate.app");
+        package(&bundle.join("Contents/Resources"), "macos-arm64", &[]);
+        let exe = bundle.join("Contents/MacOS/private-translate");
+        let found = Installation::of_executable(&exe, true).unwrap();
+        assert_eq!(found.root, dir.path().join("Applications"));
+        assert_eq!(found.entries, ["Private Translate.app"]);
+        assert_eq!(found.bundle.as_deref(), Some(bundle.as_path()));
+        assert_eq!(
+            found.asset_name(Version::current()),
+            format!("private-translate-{}-macos-arm64.dmg", Version::current())
+        );
+        assert_eq!(
+            found.staging(),
+            dir.path().join("Applications/.Private Translate-update")
+        );
+    }
+
+    #[test]
+    fn drops_the_verbatim_prefix_of_drive_paths_only() {
+        assert_eq!(
+            without_verbatim_prefix(r"\\?\E:\apps\plamo\app.exe"),
+            Some(r"E:\apps\plamo\app.exe")
+        );
+        assert_eq!(
+            without_verbatim_prefix(r"\\?\UNC\server\share\app.exe"),
+            None
+        );
+        assert_eq!(without_verbatim_prefix(r"E:\apps\app.exe"), None);
+        assert_eq!(without_verbatim_prefix("/usr/bin/app"), None);
+    }
+
+    #[test]
+    fn refuses_entries_that_leave_the_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        for bad in ["..", "../x", "a/b", "C:x", "/etc", ""] {
+            package(dir.path(), "linux-x86_64", &[bad]);
+            assert!(
+                PackageInfo::read(&dir.path().join(MARKER)).is_err(),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn reads_checksums() {
+        let digest = "ab".repeat(32);
+        let sums = format!(
+            "{digest}  private-translate-0.5.1-linux-x86_64.tar.gz\n{}  *other.zip\n",
+            "CD".repeat(32)
+        );
+        assert_eq!(
+            checksum_of(&sums, "private-translate-0.5.1-linux-x86_64.tar.gz"),
+            Some(digest)
+        );
+        assert_eq!(checksum_of(&sums, "other.zip"), Some("cd".repeat(32)));
+        assert_eq!(checksum_of(&sums, "missing.zip"), None);
+        assert_eq!(checksum_of("short  a.zip", "a.zip"), None);
+    }
+
+    #[test]
+    fn strips_the_top_folder_and_refuses_unsafe_paths() {
+        assert_eq!(inner_path("top/").unwrap(), None);
+        assert_eq!(
+            inner_path("top/a/b.dll").unwrap(),
+            Some(PathBuf::from("a/b.dll"))
+        );
+        assert_eq!(
+            inner_path("top\\resources\\manifest.json").unwrap(),
+            Some(PathBuf::from("resources/manifest.json"))
+        );
+        for bad in ["top/../x", "../top/x", "top/C:/x", "top/./x"] {
+            assert!(inner_path(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn unpacks_zips_and_tarballs() {
+        let dir = tempfile::tempdir().unwrap();
+        // A zip as Compress-Archive writes it: the folder, backslashes in names.
+        let zip_path = dir.path().join("p.zip");
+        {
+            let mut zip = zip::ZipWriter::new(File::create(&zip_path).unwrap());
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            zip.add_directory("top/", options).unwrap();
+            zip.start_file("top\\app.exe", options).unwrap();
+            zip.write_all(b"exe").unwrap();
+            zip.start_file("top\\resources\\manifest.json", options)
+                .unwrap();
+            zip.write_all(b"{}").unwrap();
+            zip.finish().unwrap();
+        }
+        let out = dir.path().join("zip-out");
+        unpack_zip(&zip_path, &out).unwrap();
+        assert_eq!(fs::read(out.join("app.exe")).unwrap(), b"exe");
+        assert_eq!(
+            fs::read(out.join("resources/manifest.json")).unwrap(),
+            b"{}"
+        );
+
+        let tar_path = dir.path().join("p.tar.gz");
+        {
+            let gz = flate2::write::GzEncoder::new(
+                File::create(&tar_path).unwrap(),
+                flate2::Compression::fast(),
+            );
+            let mut tar = tar::Builder::new(gz);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(3);
+            header.set_mode(0o755);
+            header.set_cksum();
+            tar.append_data(&mut header, "top/app", &b"bin"[..])
+                .unwrap();
+            tar.into_inner().unwrap().finish().unwrap();
+        }
+        let out = dir.path().join("tar-out");
+        unpack_tar_gz(&tar_path, &out).unwrap();
+        assert_eq!(fs::read(out.join("app")).unwrap(), b"bin");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(out.join("app")).unwrap().permissions().mode();
+            assert_eq!(mode & 0o111, 0o111, "executable");
+        }
+
+        // A link is refused.
+        let link_path = dir.path().join("link.tar.gz");
+        {
+            let gz = flate2::write::GzEncoder::new(
+                File::create(&link_path).unwrap(),
+                flate2::Compression::fast(),
+            );
+            let mut tar = tar::Builder::new(gz);
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(tar::EntryType::Symlink);
+            header.set_size(0);
+            tar.append_link(&mut header, "top/link", "/etc/passwd")
+                .unwrap();
+            tar.into_inner().unwrap().finish().unwrap();
+        }
+        assert!(unpack_tar_gz(&link_path, &dir.path().join("link-out")).is_err());
+    }
+
+    #[test]
+    fn keeps_a_prepared_update_and_reports_a_failed_one() {
+        let dir = tempfile::tempdir().unwrap();
+        package(dir.path(), "linux-x86_64", &["app"]);
+        let installation = Installation::of_executable(&dir.path().join("app"), false).unwrap();
+        let staging = installation.staging();
+        let current = Version::current();
+        let newer = Version {
+            patch: current.patch + 1,
+            ..current
+        };
+        fs::create_dir_all(staging.join("old-1")).unwrap();
+        write_json(&staging.join(READY), &Ready { version: newer }).unwrap();
+        fs::create_dir_all(installation.new_dir()).unwrap();
+        assert_eq!(installation.prepared(current), None, "no files");
+        package(&installation.new_dir(), "linux-x86_64", &["app"]);
+        assert_eq!(installation.prepared(current), Some(newer));
+        assert_eq!(installation.clean_up(current), None);
+        assert!(installation.new_dir().is_dir(), "kept");
+        assert!(!staging.join("old-1").exists(), "removed");
+
+        // Once installed, the same version is not newer: all goes.
+        assert_eq!(installation.prepared(newer), None);
+        assert_eq!(installation.clean_up(newer), None);
+        assert!(!staging.exists());
+
+        fs::create_dir_all(installation.new_dir()).unwrap();
+        write_json(&staging.join(READY), &Ready { version: newer }).unwrap();
+        fs::write(staging.join(FAILED), "could not move app").unwrap();
+        assert_eq!(
+            installation.clean_up(current).as_deref(),
+            Some("could not move app")
+        );
+        assert!(!staging.exists(), "a failed update is not kept");
+    }
+}

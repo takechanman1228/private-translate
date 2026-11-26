@@ -1,0 +1,46 @@
+[
+  {
+    "file": "NotoSansSC-Regular.ttf",
+    "url": "https://fonts.gstatic.com/s/notosanssc/v41/k3kCo84MPvpLmixcA63oeAL7Iqp5IZJF9bmaG9_FnYxNbPzS5HE.ttf",
+    "sha256": "d45f67f0a7c0ca3f256950777ce6a61cc7ce5f9696d02900cbbaac25f8aa7d16",
+    "version": "Version 2.004-H2;hotconv 1.0.118;makeotfexe 2.5.65603"
+  },
+  {
+    "file": "NotoSansSC-OFL.txt",
+    "url": "https://raw.githubusercontent.com/google/fonts/06bfe0d62a98375cb09c942fa18e68bd32cff057/ofl/notosanssc/OFL.txt",
+    "sha256": "1c05c68c34f9708415aada51f17e1b0092d2cea709bf4a94cd38114f9e73d7d9"
+  },
+  {
+    "file": "NotoSansTC-Regular.ttf",
+    "url": "https://fonts.gstatic.com/s/notosanstc/v40/-nFuOG829Oofr2wohFbTp9ifNAn722rq0MXz76Cy_CpOtma3uNQ.ttf",
+    "sha256": "add35d53f70727657b4509531677c4e3712b67df3d54661efdee5d3a0c16d954",
+    "version": "Version 2.004-H2;hotconv 1.0.118;makeotfexe 2.5.65603"
+  },
+  {
+    "file": "NotoSansTC-OFL.txt",
+    "url": "https://raw.githubusercontent.com/google/fonts/06bfe0d62a98375cb09c942fa18e68bd32cff057/ofl/notosanstc/OFL.txt",
+    "sha256": "1c05c68c34f9708415aada51f17e1b0092d2cea709bf4a94cd38114f9e73d7d9"
+  },
+  {
+    "file": "NotoSansKR-Regular.ttf",
+    "url": "https://fonts.gstatic.com/s/notosanskr/v40/PbyxFmXiEBPT4ITbgNA5Cgms3VYcOA-vvnIzzuoyeLTq8H4hfeE.ttf",
+    "sha256": "b4a747e78805bc25b610dcfc3003cb5fb2e2ec034763774b24216ed15889eef4",
+    "version": "Version 2.004-H2;hotconv 1.0.118;makeotfexe 2.5.65603"
+  },
+  {
+    "file": "NotoSansKR-OFL.txt",
+    "url": "https://raw.githubusercontent.com/google/fonts/06bfe0d62a98375cb09c942fa18e68bd32cff057/ofl/notosanskr/OFL.txt",
+    "sha256": "1c05c68c34f9708415aada51f17e1b0092d2cea709bf4a94cd38114f9e73d7d9"
+  },
+  {
+    "file": "NotoSans-Regular.ttf",
+    "url": "https://fonts.gstatic.com/s/notosans/v42/o-0mIpQlx3QUlC5A4PNB6Ryti20_6n1iPHjcz6L1SoM-jCpoiyD9A99d41P6zHtY.ttf",
+    "sha256": "fe8c022f48d8dd29f17b744d16f9346f4357e16f7d4f7be58b000ae7c291b614",
+    "version": "Version 2.015"
+  },
+  {
+    "file": "NotoSans-OFL.txt",
+    "url": "https://raw.githubusercontent.com/google/fonts/06bfe0d62a98375cb09c942fa18e68bd32cff057/ofl/notosans/OFL.txt",
+    "sha256": "cee9892f9f0cc8fe882c9e9537ee6a89621d86ee7ceaf70b02e2b2b1c25c061a"
+  }
+]

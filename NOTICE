@@ -1,0 +1,17 @@
+Private Translate
+
+See COPYRIGHT, LICENSE-MIT and LICENSE-APACHE for copyright and licence terms.
+
+Changes dated 2026-11-25
+The application, build configuration, packaging, and documentation have been
+modified for Private Translate. This snapshot starts the public change history.
+
+Third-party software
+* The patched lopdf sources under patches/lopdf carry their own MIT licence.
+  Local changes add a cumulative stream decoding budget across parsing,
+  content processing, and font processing.
+* llama.cpp is MIT-licensed. The macOS package patch loads bundled precompiled Metal shaders, with embedded shaders as a fallback.
+* The llama.cpp and Lucide licence texts are under licenses/.
+* The macOS package includes PDFium, IPA fonts, Noto fonts, and their licences.
+  scripts/notices.sh generates the complete package notices, including the
+  Rust dependencies. Models and the optional BabelDOC engine are separate.

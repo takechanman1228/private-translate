@@ -1,0 +1,49 @@
+[package]
+name = "private-translate"
+description = "Desktop app that translates text and documents with local AI models"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[features]
+# `scripts/rocm.sh cargo run -p private-translate --release --features rocm`. Packages
+# enable `engine/vulkan` and `engine/dynamic-backends` directly.
+rocm = ["engine/rocm"]
+
+[dependencies]
+unicode-segmentation.workspace = true
+files = { path = "../files" }
+# The bridge to the external babeldoc-engine (the third PDF output). It only starts the engine as
+# a separate process; no AGPL code is linked.
+babeldoc = { path = "../babeldoc" }
+appdata.workspace = true
+desktop.workspace = true
+engine.workspace = true
+update.workspace = true
+gpui-kit = "=0.9.0"
+async-channel = "2"
+rust-i18n = "4.2"
+whatlang = "0.16.4"
+serde.workspace = true
+serde_json.workspace = true
+sysinfo = { version = "0.31", default-features = false, features = ["system"] }
+
+[dev-dependencies]
+zip = { version = "9.4.2", default-features = false }
+# A test platform and simulated input, for the tests of the window's shortcuts. GPUI itself, as
+# gpui-kit depends on it: gpui-kit's own `test-support` asks for another version of taffy.
+gpui = { package = "gpui-pre", version = "=0.3.11", features = ["test-support"] }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["fs"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
+same-file = "1"
+
+[build-dependencies]
+winresource = "0.1"
