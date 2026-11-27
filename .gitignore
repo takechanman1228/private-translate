@@ -1,0 +1,10 @@
+/target
+# Packaging scratch directories (see .github/workflows/release.yml).
+/dist
+/cli
+/private-translate-*-macos-arm64.dmg
+/THIRD-PARTY-NOTICES.txt
+
+# Local verification artifacts
+.DS_Store
+*.log

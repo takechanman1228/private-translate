@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Private Translate
+Comment=Local AI document translation
+Comment[ja]=手元の AI で文書を翻訳
+Exec=private-translate
+Icon=private-translate
+Terminal=false
+Categories=Office;Utility;TextTools;
+StartupWMClass=private-translate

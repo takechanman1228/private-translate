@@ -1,0 +1,29 @@
+name: Bug report
+description: Report a problem with Private Translate.
+body:
+  - type: markdown
+    attributes:
+      value: Use a synthetic file if you attach a reproduction. Keep personal data, source text, and translations out of this report.
+  - type: input
+    id: versions
+    attributes:
+      label: Private Translate and macOS versions
+    validations:
+      required: true
+  - type: input
+    id: model
+    attributes:
+      label: Model and file format
+      description: Include the language pair if it affects the problem.
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+    validations:
+      required: true
+  - type: textarea
+    id: result
+    attributes:
+      label: Expected and actual result
+    validations:
+      required: true
